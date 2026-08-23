@@ -11,7 +11,7 @@ FAIL=0
 CURRENT=""
 
 t() { CURRENT="$1"; }
-ok()   { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$CURRENT${1:+ — $1}"; }
+ok()   { PASS=$((PASS+1)); printf '  \033[32m✓\033[0m %s\n' "$CURRENT"; }
 bad()  { FAIL=$((FAIL+1)); printf '  \033[31m✗\033[0m %s\n    %s\n' "$CURRENT" "$1"; }
 
 assert_eq()      { [ "$1" = "$2" ] && ok || bad "erwartet '$2', bekommen '$1'"; }
@@ -22,6 +22,9 @@ assert_symlink() { [ -L "$1" ] && ok || bad "kein Symlink: $1"; }
 assert_absent()  { [ ! -e "$1" ] && ok || bad "sollte nicht existieren: $1"; }
 assert_match()   { case "$1" in *"$2"*) ok ;; *) bad "'$2' nicht gefunden in: $1" ;; esac; }
 assert_nomatch() { case "$1" in *"$2"*) bad "'$2' unerwartet gefunden in: $1" ;; *) ok ;; esac; }
+
+# mtime weit in die Vergangenheit setzen — portabel, BSD-touch kennt "-d 2020-01-01" nicht.
+make_stale() { python3 -c 'import os,sys; os.utime(sys.argv[1], (0, 0))' "$1"; }
 
 # ---------------------------------------------------------------- Sandbox ----
 SANDBOX="$(mktemp -d)"
@@ -317,7 +320,7 @@ d = json.load(open(p))
 d["mcpServers"]["neu"] = {"command": "neu-mcp"}
 json.dump(d, open(p, "w"))
 PY3
-touch -d '2020-01-01' "$CCACCT_ROOT/fresh/.claude.json"
+make_stale "$CCACCT_ROOT/fresh/.claude.json"
 "$CCACCT" sync fresh >/dev/null 2>&1
 assert_match "$(cat "$CCACCT_ROOT/fresh/.claude.json")" '"neu-mcp"'
 
@@ -329,7 +332,7 @@ d = json.load(open(p))
 d["oauthAccount"] = {"emailAddress": "fresh@example.com"}
 json.dump(d, open(p, "w"))
 PY3
-touch -d '2020-01-01' "$CCACCT_ROOT/fresh/.claude.json"
+make_stale "$CCACCT_ROOT/fresh/.claude.json"
 "$CCACCT" sync fresh >/dev/null 2>&1
 assert_match "$(cat "$CCACCT_ROOT/fresh/.claude.json")" "fresh@example.com"
 
@@ -341,7 +344,7 @@ d = json.load(open(p))
 d["projects"]["/nur/hier"] = {"hasTrustDialogAccepted": True}
 json.dump(d, open(p, "w"))
 PY3
-touch -d '2020-01-01' "$CCACCT_ROOT/fresh/.claude.json"
+make_stale "$CCACCT_ROOT/fresh/.claude.json"
 "$CCACCT" sync fresh >/dev/null 2>&1
 assert_match "$(cat "$CCACCT_ROOT/fresh/.claude.json")" "/nur/hier"
 
@@ -360,7 +363,7 @@ python3 - "$CCACCT_ROOT/fresh/.claude.json" <<'PY3'
 import json, sys
 json.dump({"marker": "unberuehrt"}, open(sys.argv[1], "w"))
 PY3
-touch -d '2020-01-01' "$CCACCT_ROOT/fresh/.claude.json"
+make_stale "$CCACCT_ROOT/fresh/.claude.json"
 "$CCACCT" sync fresh --links-only >/dev/null 2>&1
 assert_match "$(cat "$CCACCT_ROOT/fresh/.claude.json")" "unberuehrt"
 

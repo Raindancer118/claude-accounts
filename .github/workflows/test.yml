@@ -1,0 +1,41 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Testsuite (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Umgebung protokollieren
+        run: |
+          bash --version | head -1
+          python3 --version
+
+      - name: Testsuite ausführen
+        run: ./tests/test_ccacct.sh
+
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ShellCheck installieren
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: bin/ccacct prüfen
+        run: shellcheck --severity=warning bin/ccacct
+
+      - name: Testsuite prüfen
+        run: shellcheck --severity=warning tests/test_ccacct.sh
