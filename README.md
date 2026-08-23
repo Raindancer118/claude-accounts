@@ -1,5 +1,7 @@
 # ccacct — mehrere Claude-Code-Accounts, ein einziges Setup
 
+[![Tests](https://github.com/Raindancer118/claude-accounts/actions/workflows/test.yml/badge.svg)](https://github.com/Raindancer118/claude-accounts/actions/workflows/test.yml)
+
 Claude Code kennt keinen eingebauten Account-Switcher: pro Configdir gibt es genau
 eine Anmeldung. `ccacct` nutzt das aus — ein `CLAUDE_CONFIG_DIR` pro Account.
 
