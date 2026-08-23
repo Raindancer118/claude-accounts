@@ -1,0 +1,424 @@
+#!/usr/bin/env bash
+# ccacct — mehrere Claude-Code-Accounts parallel halten und nahtlos wechseln.
+#
+# Claude Code liest sein komplettes Configdir aus $CLAUDE_CONFIG_DIR: OAuth-Tokens
+# (.credentials.json bzw. ein aus sha256(configdir) abgeleiteter Keychain-Eintrag),
+# .claude.json mit dem oauthAccount, Sessions und History. Ein Configdir pro Account
+# isoliert also die Anmeldung vollständig.
+#
+# Damit sich das trotzdem wie *ein* Setup anfühlt, werden die accountneutralen
+# Bestandteile (CLAUDE.md, rules, skills, hooks, plugins, settings.json, projects …)
+# per Symlink aus dem Primärprofil geteilt.
+set -uo pipefail
+
+PRIMARY="${CCACCT_PRIMARY:-$HOME/.claude}"
+ROOT="${CCACCT_ROOT:-$HOME/.claude-accounts}"
+CLAUDE_BIN="${CCACCT_CLAUDE_BIN:-claude}"
+
+# Aus dem Primärprofil geteilte Einträge — alles, was den Account nicht kennt.
+SHARED=(
+  CLAUDE.md
+  settings.json
+  rules
+  skills
+  hooks
+  agents
+  commands
+  output-styles
+  plugins
+  scripts
+  mcp-servers
+  .mcp.json
+  servers.md
+  Mailserver.md
+  projects
+)
+# Nur geteilt, wenn nicht --isolate-projects gesetzt ist.
+OPTIONAL_SHARED=(projects)
+
+# Nie teilen — hier steckt die Identität bzw. accountgebundener Zustand drin:
+#   .credentials.json .claude.json history.jsonl sessions/ tasks/ file-history/
+#   session-env/ shell-snapshots/ statsig/ todos/ cache/ stats-cache.json
+
+# ------------------------------------------------------------------ Helfer ----
+die()  { printf '\033[31mFehler:\033[0m %s\n' "$*" >&2; exit 1; }
+info() { printf '%s\n' "$*"; }
+
+is_valid_name() {
+  case "$1" in
+    ''|*/*|*' '*|.|..|.*) return 1 ;;
+    default)              return 1 ;;
+    *) [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ;;
+  esac
+}
+
+profile_dir() {
+  local name="$1"
+  if [ "$name" = "default" ]; then printf '%s\n' "$PRIMARY"; return 0; fi
+  is_valid_name "$name" || return 1
+  [ -d "$ROOT/$name" ] || return 1
+  printf '%s\n' "$ROOT/$name"
+}
+
+# Das globale .claude.json liegt bei gesetztem CLAUDE_CONFIG_DIR *in* diesem
+# Verzeichnis, sonst in $HOME.
+global_json_for() {
+  local dir="$1"
+  if [ "$dir" = "$PRIMARY" ]; then
+    printf '%s\n' "$(dirname "$PRIMARY")/.claude.json"
+  else
+    printf '%s\n' "$dir/.claude.json"
+  fi
+}
+
+list_profiles() {
+  printf 'default\n'
+  [ -d "$ROOT" ] || return 0
+  local d
+  for d in "$ROOT"/*/; do
+    [ -d "$d" ] || continue
+    basename "$d"
+  done | sort
+}
+
+# Gibt "email|subscription|status" für ein Configdir aus.
+account_info() {
+  local dir="$1" gj
+  gj="$(global_json_for "$dir")"
+  python3 - "$dir/.credentials.json" "$gj" <<'PY'
+import json, sys, time, os
+
+cred_path, json_path = sys.argv[1], sys.argv[2]
+
+def load(p):
+    try:
+        with open(p) as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+cred = load(cred_path).get("claudeAiOauth") or {}
+acct = load(json_path).get("oauthAccount") or {}
+
+email = acct.get("emailAddress") or "—"
+sub = cred.get("subscriptionType") or "—"
+
+if not cred.get("accessToken"):
+    status = "nicht eingeloggt"
+else:
+    exp = cred.get("expiresAt")
+    ref = cred.get("refreshTokenExpiresAt")
+    now = time.time() * 1000
+    if isinstance(exp, (int, float)) and exp < now:
+        if isinstance(ref, (int, float)) and ref > now:
+            status = "Token abgelaufen (erneuerbar)"
+        else:
+            status = "abgelaufen"
+    else:
+        status = "aktiv"
+
+print("%s|%s|%s" % (email, sub, status))
+PY
+}
+
+# ------------------------------------------------------------- Verlinkung ----
+share_one() {
+  local src="$1" dst="$2"
+  [ -e "$src" ] || return 0                       # im Primärprofil (noch) nicht vorhanden
+  if [ -L "$dst" ]; then
+    [ "$(readlink "$dst")" = "$src" ] && return 0
+    rm -f "$dst"
+  elif [ -e "$dst" ]; then
+    # Claude Code hat den Link durch eine echte Datei ersetzt (atomarer Write).
+    rm -rf "$dst"
+  fi
+  ln -s "$src" "$dst"
+}
+
+link_shared() {
+  local dir="$1" isolate_projects="$2" item skip
+  for item in "${SHARED[@]}"; do
+    if [ "$isolate_projects" = "yes" ]; then
+      skip=no
+      for o in "${OPTIONAL_SHARED[@]}"; do [ "$item" = "$o" ] && skip=yes; done
+      [ "$skip" = "yes" ] && continue
+    fi
+    share_one "$PRIMARY/$item" "$dir/$item"
+  done
+}
+
+# ---------------------------------------------------------------- Befehle ----
+cmd_add() {
+  local name="" isolate=no arg
+  for arg in "$@"; do
+    case "$arg" in
+      --isolate-projects) isolate=yes ;;
+      -*) die "unbekannte Option: $arg" ;;
+      *)  [ -n "$name" ] && die "zu viele Argumente"; name="$arg" ;;
+    esac
+  done
+  [ -n "$name" ] || die "Name fehlt — Aufruf: ccacct add <name> [--isolate-projects]"
+  [ "$name" = "default" ] && die "'default' ist reserviert für dein bestehendes $PRIMARY"
+  is_valid_name "$name" || die "ungültiger Profilname: $name"
+  [ -d "$ROOT/$name" ] && die "Profil '$name' existiert bereits"
+  [ -d "$PRIMARY" ] || die "Primärprofil nicht gefunden: $PRIMARY"
+
+  mkdir -p "$ROOT/$name" || die "konnte $ROOT/$name nicht anlegen"
+  chmod 700 "$ROOT/$name"
+  [ "$isolate" = "yes" ] && : > "$ROOT/$name/.ccacct-isolate-projects"
+  link_shared "$ROOT/$name" "$isolate"
+
+  info "Profil '$name' angelegt: $ROOT/$name"
+  info "Jetzt anmelden mit:  ccacct login $name"
+}
+
+cmd_login() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "Name fehlt — Aufruf: ccacct login <name>"
+  local dir
+  dir="$(profile_dir "$name")" || die "unbekanntes Profil: $name"
+  info "Starte Claude Code für Profil '$name'."
+  info "Falls kein Login-Dialog erscheint, tippe im Chat: /login"
+  if [ "$name" = "default" ]; then
+    exec "$CLAUDE_BIN"
+  else
+    exec env CLAUDE_CONFIG_DIR="$dir" "$CLAUDE_BIN"
+  fi
+}
+
+cmd_logout() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "Name fehlt — Aufruf: ccacct logout <name>"
+  [ "$name" = "default" ] && die "Für das Primärprofil bitte 'claude /logout' verwenden"
+  local dir
+  dir="$(profile_dir "$name")" || die "unbekanntes Profil: $name"
+  exec env CLAUDE_CONFIG_DIR="$dir" "$CLAUDE_BIN" /logout
+}
+
+cmd_list() {
+  local active_dir="${CLAUDE_CONFIG_DIR:-}" name dir marker rows=""
+  while read -r name; do
+    dir="$(profile_dir "$name")" || continue
+    marker=" "
+    if [ -n "$active_dir" ]; then
+      [ "$active_dir" = "$dir" ] && marker="*"
+    elif [ "$name" = "default" ]; then
+      marker="*"
+    fi
+    rows+="$marker|$name|$(account_info "$dir")"$'\n'
+  done < <(list_profiles)
+
+  # Ausrichtung in Python, weil bash' printf Bytes statt Zeichen zählt und
+  # E-Mails/Platzhalter wie "—" die Spalten sonst verschieben.
+  printf '%s' "$rows" | python3 -c '
+import sys
+rows = [l.split("|") for l in sys.stdin.read().splitlines() if l.strip()]
+head = [" ", "PROFIL", "ACCOUNT", "ABO", "STATUS"]
+widths = [max(len(r[i]) for r in [head] + rows) for i in range(4)]
+def fmt(r, bold=False):
+    cells = [r[i].ljust(widths[i]) for i in range(4)] + [r[4]]
+    line = "  ".join(cells).rstrip()
+    return "\033[1m%s\033[0m" % line if bold else line
+print(fmt(head, bold=True))
+for r in rows:
+    print(fmt(r))
+'
+}
+
+cmd_which() {
+  local active_dir="${CLAUDE_CONFIG_DIR:-}" name dir
+  if [ -z "$active_dir" ]; then printf 'default\n'; return 0; fi
+  while read -r name; do
+    dir="$(profile_dir "$name")" || continue
+    if [ "$active_dir" = "$dir" ]; then printf '%s\n' "$name"; return 0; fi
+  done < <(list_profiles)
+  printf '%s (unbekanntes Configdir)\n' "$active_dir"
+}
+
+cmd_path() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "Name fehlt — Aufruf: ccacct path <name>"
+  local dir
+  dir="$(profile_dir "$name")" || die "unbekanntes Profil: $name"
+  printf '%s\n' "$dir"
+}
+
+cmd_run() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "Name fehlt — Aufruf: ccacct run <name> [claude-args…]"
+  shift
+  local dir
+  dir="$(profile_dir "$name")" || die "unbekanntes Profil: $name"
+  if [ "$name" = "default" ]; then
+    exec env -u CLAUDE_CONFIG_DIR "$CLAUDE_BIN" "$@"
+  else
+    exec env CLAUDE_CONFIG_DIR="$dir" "$CLAUDE_BIN" "$@"
+  fi
+}
+
+cmd_exec() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "Name fehlt — Aufruf: ccacct exec <name> -- <kommando…>"
+  shift
+  [ "${1:-}" = "--" ] && shift
+  [ $# -gt 0 ] || die "Kommando fehlt"
+  local dir
+  dir="$(profile_dir "$name")" || die "unbekanntes Profil: $name"
+  if [ "$name" = "default" ]; then
+    exec env -u CLAUDE_CONFIG_DIR "$@"
+  else
+    exec env CLAUDE_CONFIG_DIR="$dir" "$@"
+  fi
+}
+
+cmd_sync() {
+  local target="${1:---all}" name dir isolate
+  if [ "$target" = "--all" ]; then
+    [ -d "$ROOT" ] || { info "Keine Profile vorhanden."; return 0; }
+    for dir in "$ROOT"/*/; do
+      [ -d "$dir" ] || continue
+      name="$(basename "$dir")"
+      isolate=no; [ -e "$dir/.ccacct-isolate-projects" ] && isolate=yes
+      link_shared "${dir%/}" "$isolate"
+      info "synchronisiert: $name"
+    done
+  else
+    [ "$target" = "default" ] && die "Das Primärprofil ist die Quelle — nichts zu synchronisieren"
+    dir="$(profile_dir "$target")" || die "unbekanntes Profil: $target"
+    isolate=no; [ -e "$dir/.ccacct-isolate-projects" ] && isolate=yes
+    link_shared "$dir" "$isolate"
+    info "synchronisiert: $target"
+  fi
+}
+
+cmd_rm() {
+  local name="" force=no arg
+  for arg in "$@"; do
+    case "$arg" in
+      --force|-f) force=yes ;;
+      -*) die "unbekannte Option: $arg" ;;
+      *)  [ -n "$name" ] && die "zu viele Argumente"; name="$arg" ;;
+    esac
+  done
+  [ -n "$name" ] || die "Name fehlt — Aufruf: ccacct rm <name> --force"
+  [ "$name" = "default" ] && die "Das Primärprofil ($PRIMARY) wird von ccacct niemals gelöscht"
+  is_valid_name "$name" || die "ungültiger Profilname: $name"
+  [ -d "$ROOT/$name" ] || die "unbekanntes Profil: $name"
+  if [ "$force" != "yes" ]; then
+    die "Löscht Anmeldung, Sessions und History von '$name'. Bestätige mit: ccacct rm $name --force"
+  fi
+  # Symlinks zuerst entfernen, damit kein rm -rf durch einen Link läuft.
+  local item
+  for item in "${SHARED[@]}"; do
+    [ -L "$ROOT/$name/$item" ] && rm -f "$ROOT/$name/$item"
+  done
+  find "$ROOT/$name" -type l -delete 2>/dev/null
+  rm -rf "${ROOT:?}/${name:?}"
+  info "Profil '$name' gelöscht. Geteilte Inhalte in $PRIMARY sind unangetastet."
+}
+
+cmd_shell_init() {
+  local shell="${1:-}"
+  case "$shell" in
+    fish) cat <<EOF
+# ccacct — fish-Integration.  In config.fish:  ccacct shell-init fish | source
+function ccacct --description 'Claude-Code-Accounts verwalten und wechseln'
+    if test (count \$argv) -ge 1; and test "\$argv[1]" = use
+        if test (count \$argv) -lt 2
+            echo "Aufruf: ccacct use <name>" >&2
+            return 1
+        end
+        set -l name \$argv[2]
+        if test "\$name" = default
+            set -e CLAUDE_CONFIG_DIR
+            echo "Aktives Profil: default"
+            return 0
+        end
+        set -l dir (command $0 path \$name); or return 1
+        set -gx CLAUDE_CONFIG_DIR \$dir
+        echo "Aktives Profil: \$name (\$dir)"
+        return 0
+    end
+    command $0 \$argv
+end
+
+complete -c ccacct -f
+complete -c ccacct -n '__fish_use_subcommand' -a 'use list add login logout run exec path which sync rm shell-init help'
+complete -c ccacct -n '__fish_seen_subcommand_from use run exec path login logout sync rm' -a '(command $0 list 2>/dev/null | tail -n +2 | string trim | string replace -r "^\\\\*?\\\\s*" "" | string split -f1 " ")'
+EOF
+      ;;
+    bash|zsh) cat <<EOF
+# ccacct — bash/zsh-Integration.  In .bashrc/.zshrc:  eval "\$($0 shell-init bash)"
+ccacct() {
+  if [ "\${1:-}" = "use" ]; then
+    if [ -z "\${2:-}" ]; then echo "Aufruf: ccacct use <name>" >&2; return 1; fi
+    if [ "\$2" = "default" ]; then
+      unset CLAUDE_CONFIG_DIR
+      echo "Aktives Profil: default"
+      return 0
+    fi
+    local dir
+    dir="\$(command $0 path "\$2")" || return 1
+    export CLAUDE_CONFIG_DIR="\$dir"
+    echo "Aktives Profil: \$2 (\$dir)"
+    return 0
+  fi
+  command $0 "\$@"
+}
+EOF
+      ;;
+    *) die "unbekannte Shell: '${shell:-}' (unterstützt: fish, bash, zsh)" ;;
+  esac
+}
+
+cmd_help() {
+  cat <<EOF
+ccacct — mehrere Claude-Code-Accounts parallel halten und nahtlos wechseln
+
+  ccacct list                       Profile mit Account, Abo und Login-Status
+  ccacct add <name> [--isolate-projects]
+                                    Neues Profil anlegen (teilt Config mit default)
+  ccacct login <name>               Claude Code starten und in dem Profil anmelden
+  ccacct logout <name>              Aus dem Profil abmelden
+  ccacct use <name>                 Profil für die aktuelle Shell aktivieren
+                                    (benötigt 'ccacct shell-init', s.u.)
+  ccacct run <name> [args…]         Einmalig Claude Code in dem Profil starten
+  ccacct exec <name> -- <cmd…>      Beliebiges Kommando im Profilkontext ausführen
+  ccacct which                      Aktuell aktives Profil
+  ccacct path <name>                Configdir des Profils
+  ccacct sync [<name>|--all]        Geteilte Symlinks reparieren/nachziehen
+  ccacct rm <name> --force          Profil samt Anmeldung löschen
+  ccacct shell-init fish|bash|zsh   Shell-Integration ausgeben
+
+Geteilt mit dem Primärprofil ($PRIMARY):
+  ${SHARED[*]}
+Getrennt je Profil:
+  Anmeldung (.credentials.json), .claude.json, History, Sessions, Tasks
+
+Umgebungsvariablen: CCACCT_PRIMARY, CCACCT_ROOT, CCACCT_CLAUDE_BIN
+EOF
+}
+
+# ------------------------------------------------------------------- Main ----
+main() {
+  local cmd="${1:-list}"
+  [ $# -gt 0 ] && shift
+  case "$cmd" in
+    list|ls)          cmd_list "$@" ;;
+    add|new|create)   cmd_add "$@" ;;
+    login)            cmd_login "$@" ;;
+    logout)           cmd_logout "$@" ;;
+    run)              cmd_run "$@" ;;
+    exec)             cmd_exec "$@" ;;
+    which|current)    cmd_which "$@" ;;
+    path|dir)         cmd_path "$@" ;;
+    sync)             cmd_sync "$@" ;;
+    rm|remove|delete) cmd_rm "$@" ;;
+    shell-init)       cmd_shell_init "$@" ;;
+    use)              die "'use' muss die Shell selbst ausführen — richte die Integration ein: ccacct shell-init fish | source" ;;
+    help|-h|--help)   cmd_help ;;
+    *)                die "unbekanntes Kommando: $cmd (siehe 'ccacct help')" ;;
+  esac
+}
+
+main "$@"
