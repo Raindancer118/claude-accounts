@@ -40,8 +40,26 @@ echo '{"model":"opus"}'      > "$CCACCT_PRIMARY/settings.json"
 echo '{"claudeAiOauth":{"accessToken":"sk-ant-oat-PRIMARY","subscriptionType":"pro","expiresAt":4102444800000}}' \
                              > "$CCACCT_PRIMARY/.credentials.json"
 echo "transcript"            > "$CCACCT_PRIMARY/projects/proj-a/log.jsonl"
+echo "prompt"                > "$CCACCT_PRIMARY/history.jsonl"
+echo "session"               > "$CCACCT_PRIMARY/sessions/s1.json"
+mkdir -p "$CCACCT_PRIMARY"/{.git,cache,plans,memory}
+echo "gitdata"               > "$CCACCT_PRIMARY/.git/HEAD"
+echo "cached"                > "$CCACCT_PRIMARY/cache/x.json"
+echo "plan"                  > "$CCACCT_PRIMARY/plans/p1.md"
+echo "note"                  > "$CCACCT_PRIMARY/memory/m.md"
+echo "log"                   > "$CCACCT_PRIMARY/daemon.log"
 cat > "$SANDBOX/.claude.json" <<'EOF'
-{"oauthAccount":{"emailAddress":"primary@example.com","organizationUuid":"org-1"},"numStartups":42}
+{
+  "oauthAccount": {"emailAddress": "primary@example.com", "organizationUuid": "org-1"},
+  "userID": "primary-user-id",
+  "machineID": "primary-machine",
+  "numStartups": 42,
+  "cachedGrowthBookFeatures": {"junk": true},
+  "mcpServers": {"diary": {"command": "diary-mcp"}},
+  "projects": {"/home/tom/x": {"hasTrustDialogAccepted": true, "allowedTools": ["Bash(ls)"]}},
+  "hasCompletedOnboarding": true,
+  "skillUsage": {"senior-dev": 7}
+}
 EOF
 
 # Fake-claude, das nur seine Umgebung protokolliert.
@@ -244,6 +262,169 @@ assert_file "$CCACCT_PRIMARY/CLAUDE.md"
 
 t "rm eines Profils lässt geteilte projects unangetastet"
 assert_file "$CCACCT_PRIMARY/projects/proj-a/log.jsonl"
+
+printf '\n\033[1mIdentisches Setup (Denylist statt Allowlist)\033[0m\n'
+
+t "beliebige neue Datei im Primaerprofil wird automatisch geteilt"
+echo "neu" > "$CCACCT_PRIMARY/website-spielregeln.md"
+"$CCACCT" add fresh >/dev/null 2>&1
+assert_symlink "$CCACCT_ROOT/fresh/website-spielregeln.md"
+
+t "beliebiges neues Verzeichnis im Primaerprofil wird automatisch geteilt"
+assert_symlink "$CCACCT_ROOT/fresh/plans"
+
+t "memory/ wird geteilt"
+assert_symlink "$CCACCT_ROOT/fresh/memory"
+
+t ".git wird NICHT verlinkt (wuerde das Profil zum Worktree machen)"
+assert_absent "$CCACCT_ROOT/fresh/.git"
+
+t "sessions werden nicht geteilt"
+assert_absent "$CCACCT_ROOT/fresh/sessions"
+
+t "cache wird nicht geteilt"
+assert_absent "$CCACCT_ROOT/fresh/cache"
+
+t "daemon.log wird nicht geteilt"
+assert_absent "$CCACCT_ROOT/fresh/daemon.log"
+
+t "add erzeugt eine .claude.json im Profil"
+assert_file "$CCACCT_ROOT/fresh/.claude.json"
+
+t "Profil-.claude.json uebernimmt mcpServers aus dem Primaerprofil"
+assert_match "$(cat "$CCACCT_ROOT/fresh/.claude.json")" '"diary"'
+
+t "Profil-.claude.json uebernimmt projects inkl. Trust und Permissions"
+assert_match "$(cat "$CCACCT_ROOT/fresh/.claude.json")" "hasTrustDialogAccepted"
+
+t "Profil-.claude.json uebernimmt hasCompletedOnboarding"
+assert_match "$(cat "$CCACCT_ROOT/fresh/.claude.json")" "hasCompletedOnboarding"
+
+t "Profil-.claude.json uebernimmt NICHT den oauthAccount des Primaerprofils"
+assert_nomatch "$(cat "$CCACCT_ROOT/fresh/.claude.json")" "primary@example.com"
+
+t "Profil-.claude.json uebernimmt NICHT die userID des Primaerprofils"
+assert_nomatch "$(cat "$CCACCT_ROOT/fresh/.claude.json")" "primary-user-id"
+
+t "Profil-.claude.json uebernimmt keine accountgebundenen Caches"
+assert_nomatch "$(cat "$CCACCT_ROOT/fresh/.claude.json")" "cachedGrowthBookFeatures"
+
+t "sync zieht einen neu angelegten MCP-Server ins Profil nach"
+python3 - "$SANDBOX/.claude.json" <<'PY3'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"]["neu"] = {"command": "neu-mcp"}
+json.dump(d, open(p, "w"))
+PY3
+touch -d '2020-01-01' "$CCACCT_ROOT/fresh/.claude.json"
+"$CCACCT" sync fresh >/dev/null 2>&1
+assert_match "$(cat "$CCACCT_ROOT/fresh/.claude.json")" '"neu-mcp"'
+
+t "sync laesst die Anmeldung des Profils unangetastet"
+python3 - "$CCACCT_ROOT/fresh/.claude.json" <<'PY3'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["oauthAccount"] = {"emailAddress": "fresh@example.com"}
+json.dump(d, open(p, "w"))
+PY3
+touch -d '2020-01-01' "$CCACCT_ROOT/fresh/.claude.json"
+"$CCACCT" sync fresh >/dev/null 2>&1
+assert_match "$(cat "$CCACCT_ROOT/fresh/.claude.json")" "fresh@example.com"
+
+t "sync erhaelt profil-eigene projects-Eintraege"
+python3 - "$CCACCT_ROOT/fresh/.claude.json" <<'PY3'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["projects"]["/nur/hier"] = {"hasTrustDialogAccepted": True}
+json.dump(d, open(p, "w"))
+PY3
+touch -d '2020-01-01' "$CCACCT_ROOT/fresh/.claude.json"
+"$CCACCT" sync fresh >/dev/null 2>&1
+assert_match "$(cat "$CCACCT_ROOT/fresh/.claude.json")" "/nur/hier"
+
+t "sync ueberspringt die .claude.json einer laufenden Session"
+touch "$CCACCT_ROOT/fresh/.claude.json"
+out="$("$CCACCT" sync fresh 2>&1)"
+assert_match "$out" "uebersprungen"
+
+t "sync --force schreibt auch bei laufender Session"
+touch "$CCACCT_ROOT/fresh/.claude.json"
+out="$("$CCACCT" sync fresh --force 2>&1)"
+assert_nomatch "$out" "uebersprungen"
+
+t "sync --links-only fasst .claude.json nicht an"
+python3 - "$CCACCT_ROOT/fresh/.claude.json" <<'PY3'
+import json, sys
+json.dump({"marker": "unberuehrt"}, open(sys.argv[1], "w"))
+PY3
+touch -d '2020-01-01' "$CCACCT_ROOT/fresh/.claude.json"
+"$CCACCT" sync fresh --links-only >/dev/null 2>&1
+assert_match "$(cat "$CCACCT_ROOT/fresh/.claude.json")" "unberuehrt"
+
+printf '\n\033[1mdoctor — Drift-Erkennung\033[0m\n'
+
+t "doctor meldet ein sauberes Profil als in Ordnung"
+"$CCACCT" sync fresh --force >/dev/null 2>&1
+assert_ok "$CCACCT" doctor fresh
+
+t "doctor erkennt einen fehlenden Symlink"
+rm "$CCACCT_ROOT/fresh/CLAUDE.md"
+assert_fails "$CCACCT" doctor fresh
+
+t "doctor benennt den fehlenden Eintrag"
+out="$("$CCACCT" doctor fresh 2>&1)"
+assert_match "$out" "CLAUDE.md"
+
+t "doctor erkennt einen fehlenden .claude.json-Schluessel"
+"$CCACCT" sync fresh --force >/dev/null 2>&1
+python3 - "$CCACCT_ROOT/fresh/.claude.json" <<'PY3'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d.pop("mcpServers", None)
+json.dump(d, open(p, "w"))
+PY3
+assert_fails "$CCACCT" doctor fresh
+
+t "doctor repariert nichts von selbst"
+assert_nomatch "$("$CCACCT" doctor fresh 2>&1)" "repariert"
+
+t "doctor --fix behebt die Drift"
+"$CCACCT" doctor fresh --fix >/dev/null 2>&1
+assert_ok "$CCACCT" doctor fresh
+
+t "doctor --all prueft alle Profile"
+out="$("$CCACCT" doctor --all 2>&1)"
+assert_match "$out" "fresh"
+
+printf '\n\033[1mautosync — Hook in der geteilten settings.json\033[0m\n'
+
+t "autosync status meldet zunaechst 'nicht installiert'"
+assert_eq "$("$CCACCT" autosync status 2>&1)" "autosync ist nicht installiert"
+
+t "autosync install traegt einen SessionStart-Hook ein"
+"$CCACCT" autosync install >/dev/null 2>&1
+assert_match "$(cat "$CCACCT_PRIMARY/settings.json")" "SessionStart"
+
+t "autosync install laesst bestehende Settings intakt"
+assert_match "$(cat "$CCACCT_PRIMARY/settings.json")" '"opus"'
+
+t "autosync install ist idempotent"
+"$CCACCT" autosync install >/dev/null 2>&1
+assert_eq "$(grep -c 'CCACCT_AUTOSYNC' "$CCACCT_PRIMARY/settings.json")" "1"
+
+t "autosync status meldet danach 'installiert'"
+assert_eq "$("$CCACCT" autosync status 2>&1)" "autosync ist installiert"
+
+t "autosync uninstall entfernt den Hook wieder"
+"$CCACCT" autosync uninstall >/dev/null 2>&1
+assert_nomatch "$(cat "$CCACCT_PRIMARY/settings.json")" "CCACCT_AUTOSYNC"
+
+t "autosync uninstall laesst andere Settings intakt"
+assert_match "$(cat "$CCACCT_PRIMARY/settings.json")" '"opus"'
 
 printf '\n\033[1mShell-Integration\033[0m\n'
 

@@ -1,48 +1,73 @@
 #!/usr/bin/env bash
 # ccacct — mehrere Claude-Code-Accounts parallel halten und nahtlos wechseln.
 #
-# Claude Code liest sein komplettes Configdir aus $CLAUDE_CONFIG_DIR: OAuth-Tokens
-# (.credentials.json bzw. ein aus sha256(configdir) abgeleiteter Keychain-Eintrag),
-# .claude.json mit dem oauthAccount, Sessions und History. Ein Configdir pro Account
-# isoliert also die Anmeldung vollständig.
+# Grundprinzip: Das Setup existiert genau EINMAL, im Primärprofil (~/.claude).
+# Jedes weitere Profil ist ein eigenes CLAUDE_CONFIG_DIR, dessen Inhalte per
+# Symlink auf das Primärprofil zeigen — es werden keine Kopien angelegt.
+# Getrennt ist ausschließlich, was den eingeloggten Account ausmacht.
 #
-# Damit sich das trotzdem wie *ein* Setup anfühlt, werden die accountneutralen
-# Bestandteile (CLAUDE.md, rules, skills, hooks, plugins, settings.json, projects …)
-# per Symlink aus dem Primärprofil geteilt.
+# Deshalb Denylist statt Allowlist: alles im Primärprofil wird geteilt, außer
+# den unten in ISOLATED aufgeführten Einträgen. Neue Dateien, die Claude Code
+# oder du künftig anlegst, sind damit automatisch in jedem Profil vorhanden.
 set -uo pipefail
 
 PRIMARY="${CCACCT_PRIMARY:-$HOME/.claude}"
 ROOT="${CCACCT_ROOT:-$HOME/.claude-accounts}"
 CLAUDE_BIN="${CCACCT_CLAUDE_BIN:-claude}"
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 
-# Aus dem Primärprofil geteilte Einträge — alles, was den Account nicht kennt.
-SHARED=(
-  CLAUDE.md
-  settings.json
-  rules
-  skills
-  hooks
-  agents
-  commands
-  output-styles
-  plugins
-  scripts
-  mcp-servers
-  .mcp.json
-  servers.md
-  Mailserver.md
-  projects
+# Nicht teilen — accountgebunden, sessiongebunden oder gefährlich zu verlinken.
+ISOLATED=(
+  .credentials.json          # OAuth-Tokens: DAS unterscheidet die Accounts
+  .claude.json               # enthält oauthAccount; wird stattdessen gemergt
+  .config.json               # würde Claude Codes Pfadauflösung kapern
+  .git .gitignore            # ~/.claude ist ein Repo; ein Link machte das Profil zum Worktree
+  history.jsonl              # Prompt-History der Sessions
+  sessions tasks jobs queue  # laufender Sessionzustand
+  file-history session-env shell-snapshots
+  cache paste-cache statsig todos stats-cache.json
+  daemon daemon.lock daemon.log daemon.status.json
+  .autocontinue .autoresume
+  .last-cleanup .last-update-result.json
+  diary-extract.log
+  .ccacct-isolate-projects
 )
-# Nur geteilt, wenn nicht --isolate-projects gesetzt ist.
-OPTIONAL_SHARED=(projects)
+# Nur bei --isolate-projects zusätzlich isoliert.
+OPTIONAL_ISOLATED=(projects)
 
-# Nie teilen — hier steckt die Identität bzw. accountgebundener Zustand drin:
-#   .credentials.json .claude.json history.jsonl sessions/ tasks/ file-history/
-#   session-env/ shell-snapshots/ statsig/ todos/ cache/ stats-cache.json
+# Schlüssel in .claude.json, die zum Account gehören und NICHT übernommen werden.
+# Alles andere (mcpServers, projects samt Trust und Permissions, skillUsage,
+# Onboarding-Flags …) wird aus dem Primärprofil gespiegelt.
+ACCOUNT_KEYS='[
+  "oauthAccount", "userID", "machineID", "customApiKeyResponses",
+  "numStartups", "firstStartTime", "claudeCodeFirstTokenDate",
+  "passesEligibilityCache", "passesLastSeenRemaining", "passesUpsellSeenCount",
+  "hasVisitedPasses", "overageCreditGrantCache", "cachedExtraUsageDisabledReason",
+  "hasVisitedExtraUsage", "metricsStatusCache", "subscriptionNoticeCount",
+  "fotwUpsellFulfilled", "cachedGrowthBookFeatures", "cachedGrowthBookFeaturesAt",
+  "cachedExperimentFeatures", "cachedExperimentData", "groveConfigCache",
+  "clientDataCacheSlots", "additionalModelOptionsCache", "isQualifiedForDataSharing",
+  "penguinModeOrgEnabled", "announcementImpressions", "seenNotifications",
+  "remoteControlUpsellSeenCount", "fullscreenUpsellSeenCount", "overageCreditGrant"
+]'
+
+# Eine .claude.json, die jünger als das ist, gehört vermutlich zu einer laufenden
+# Session — dann nicht hineinschreiben (außer mit --force).
+LIVE_WINDOW_SECONDS=120
 
 # ------------------------------------------------------------------ Helfer ----
 die()  { printf '\033[31mFehler:\033[0m %s\n' "$*" >&2; exit 1; }
 info() { printf '%s\n' "$*"; }
+
+is_isolated() {
+  local item="$1" isolate_projects="$2" x
+  for x in "${ISOLATED[@]}"; do [ "$item" = "$x" ] && return 0; done
+  if [ "$isolate_projects" = "yes" ]; then
+    for x in "${OPTIONAL_ISOLATED[@]}"; do [ "$item" = "$x" ] && return 0; done
+  fi
+  case "$item" in *.log) return 0 ;; esac
+  return 1
+}
 
 is_valid_name() {
   case "$1" in
@@ -71,6 +96,10 @@ global_json_for() {
   fi
 }
 
+isolate_flag_for() {
+  [ -e "$1/.ccacct-isolate-projects" ] && printf 'yes\n' || printf 'no\n'
+}
+
 list_profiles() {
   printf 'default\n'
   [ -d "$ROOT" ] || return 0
@@ -81,14 +110,10 @@ list_profiles() {
   done | sort
 }
 
-# Gibt "email|subscription|status" für ein Configdir aus.
 account_info() {
-  local dir="$1" gj
-  gj="$(global_json_for "$dir")"
-  python3 - "$dir/.credentials.json" "$gj" <<'PY'
-import json, sys, time, os
-
-cred_path, json_path = sys.argv[1], sys.argv[2]
+  local dir="$1"
+  python3 - "$dir/.credentials.json" "$(global_json_for "$dir")" <<'PY'
+import json, sys, time
 
 def load(p):
     try:
@@ -97,8 +122,8 @@ def load(p):
     except Exception:
         return {}
 
-cred = load(cred_path).get("claudeAiOauth") or {}
-acct = load(json_path).get("oauthAccount") or {}
+cred = load(sys.argv[1]).get("claudeAiOauth") or {}
+acct = load(sys.argv[2]).get("oauthAccount") or {}
 
 email = acct.get("emailAddress") or "—"
 sub = cred.get("subscriptionType") or "—"
@@ -106,14 +131,11 @@ sub = cred.get("subscriptionType") or "—"
 if not cred.get("accessToken"):
     status = "nicht eingeloggt"
 else:
-    exp = cred.get("expiresAt")
-    ref = cred.get("refreshTokenExpiresAt")
     now = time.time() * 1000
+    exp, ref = cred.get("expiresAt"), cred.get("refreshTokenExpiresAt")
     if isinstance(exp, (int, float)) and exp < now:
-        if isinstance(ref, (int, float)) and ref > now:
-            status = "Token abgelaufen (erneuerbar)"
-        else:
-            status = "abgelaufen"
+        renewable = isinstance(ref, (int, float)) and ref > now
+        status = "Token abgelaufen (erneuerbar)" if renewable else "abgelaufen"
     else:
         status = "aktiv"
 
@@ -121,10 +143,10 @@ print("%s|%s|%s" % (email, sub, status))
 PY
 }
 
-# ------------------------------------------------------------- Verlinkung ----
+# -------------------------------------------------------- Setup-Spiegelung ----
 share_one() {
   local src="$1" dst="$2"
-  [ -e "$src" ] || return 0                       # im Primärprofil (noch) nicht vorhanden
+  [ -e "$src" ] || return 0
   if [ -L "$dst" ]; then
     [ "$(readlink "$dst")" = "$src" ] && return 0
     rm -f "$dst"
@@ -136,15 +158,92 @@ share_one() {
 }
 
 link_shared() {
-  local dir="$1" isolate_projects="$2" item skip
-  for item in "${SHARED[@]}"; do
-    if [ "$isolate_projects" = "yes" ]; then
-      skip=no
-      for o in "${OPTIONAL_SHARED[@]}"; do [ "$item" = "$o" ] && skip=yes; done
-      [ "$skip" = "yes" ] && continue
-    fi
+  local dir="$1" isolate_projects="$2" item
+  for item in $(cd "$PRIMARY" && ls -A); do
+    is_isolated "$item" "$isolate_projects" && continue
     share_one "$PRIMARY/$item" "$dir/$item"
   done
+  # Verwaiste Links entfernen (im Primärprofil gelöscht oder jetzt isoliert).
+  for item in $(cd "$dir" && ls -A); do
+    [ -L "$dir/$item" ] || continue
+    case "$(readlink "$dir/$item")" in
+      "$PRIMARY"/*) ;;
+      *) continue ;;
+    esac
+    if [ ! -e "$PRIMARY/$item" ] || is_isolated "$item" "$isolate_projects"; then
+      rm -f "$dir/$item"
+    fi
+  done
+}
+
+# .claude.json ist der einzige Ort, an dem Setup und Account-Identität in einer
+# Datei stecken (mcpServers/projects neben oauthAccount). Sie kann deshalb nicht
+# verlinkt werden — stattdessen wird alles außer den ACCOUNT_KEYS gespiegelt.
+merge_claude_json() {
+  local dir="$1" force="$2"
+  local src dst
+  src="$(global_json_for "$PRIMARY")"
+  dst="$(global_json_for "$dir")"
+  [ -f "$src" ] || return 0
+  python3 - "$src" "$dst" "$force" "$LIVE_WINDOW_SECONDS" "$ACCOUNT_KEYS" <<'PY'
+import json, os, sys, time, tempfile
+
+src, dst, force, window, account_keys = sys.argv[1:6]
+account_keys = set(json.loads(account_keys))
+
+def load(p):
+    try:
+        with open(p) as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+if force != "yes" and os.path.exists(dst):
+    if time.time() - os.path.getmtime(dst) < float(window):
+        print("SKIPPED")
+        sys.exit(0)
+
+primary, profile = load(src), load(dst)
+
+for key, value in primary.items():
+    if key in account_keys:
+        continue
+    if key == "projects" and isinstance(value, dict):
+        merged = dict(profile.get("projects") or {})
+        merged.update(value)          # Primärprofil gewinnt, Eigenes bleibt erhalten
+        profile["projects"] = merged
+    else:
+        profile[key] = value
+
+# Im Primärprofil entfernte Setup-Schlüssel auch im Profil entfernen.
+for key in [k for k in profile if k not in primary and k not in account_keys]:
+    del profile[key]
+
+os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dst) or ".", prefix=".claude.json.")
+with os.fdopen(fd, "w") as fh:
+    json.dump(profile, fh, indent=2)
+os.replace(tmp, dst)
+os.chmod(dst, 0o600)
+print("MERGED")
+PY
+}
+
+sync_profile() {
+  local name="$1" links_only="$2" force="$3" dir isolate result
+  dir="$(profile_dir "$name")" || return 1
+  isolate="$(isolate_flag_for "$dir")"
+  link_shared "$dir" "$isolate"
+  if [ "$links_only" = "yes" ]; then
+    info "synchronisiert: $name (nur Links)"
+    return 0
+  fi
+  result="$(merge_claude_json "$dir" "$force")"
+  if [ "$result" = "SKIPPED" ]; then
+    info "synchronisiert: $name (Links; .claude.json uebersprungen — laufende Session, ggf. --force)"
+  else
+    info "synchronisiert: $name"
+  fi
 }
 
 # ---------------------------------------------------------------- Befehle ----
@@ -167,8 +266,10 @@ cmd_add() {
   chmod 700 "$ROOT/$name"
   [ "$isolate" = "yes" ] && : > "$ROOT/$name/.ccacct-isolate-projects"
   link_shared "$ROOT/$name" "$isolate"
+  merge_claude_json "$ROOT/$name" yes >/dev/null
 
   info "Profil '$name' angelegt: $ROOT/$name"
+  info "Setup zeigt per Symlink auf $PRIMARY — es wurde nichts kopiert."
   info "Jetzt anmelden mit:  ccacct login $name"
 }
 
@@ -208,16 +309,14 @@ cmd_list() {
     rows+="$marker|$name|$(account_info "$dir")"$'\n'
   done < <(list_profiles)
 
-  # Ausrichtung in Python, weil bash' printf Bytes statt Zeichen zählt und
-  # E-Mails/Platzhalter wie "—" die Spalten sonst verschieben.
+  # Ausrichtung in Python, weil bash' printf Bytes statt Zeichen zählt.
   printf '%s' "$rows" | python3 -c '
 import sys
 rows = [l.split("|") for l in sys.stdin.read().splitlines() if l.strip()]
 head = [" ", "PROFIL", "ACCOUNT", "ABO", "STATUS"]
 widths = [max(len(r[i]) for r in [head] + rows) for i in range(4)]
 def fmt(r, bold=False):
-    cells = [r[i].ljust(widths[i]) for i in range(4)] + [r[4]]
-    line = "  ".join(cells).rstrip()
+    line = "  ".join([r[i].ljust(widths[i]) for i in range(4)] + [r[4]]).rstrip()
     return "\033[1m%s\033[0m" % line if bold else line
 print(fmt(head, bold=True))
 for r in rows:
@@ -272,23 +371,186 @@ cmd_exec() {
 }
 
 cmd_sync() {
-  local target="${1:---all}" name dir isolate
+  local target="" links_only=no force=no quiet=no arg
+  for arg in "$@"; do
+    case "$arg" in
+      --all)        target="--all" ;;
+      --links-only) links_only=yes ;;
+      --force|-f)   force=yes ;;
+      --quiet|-q)   quiet=yes ;;
+      -*)           die "unbekannte Option: $arg" ;;
+      *)            target="$arg" ;;
+    esac
+  done
+  [ -n "$target" ] || target="--all"
+
+  local out name dir
   if [ "$target" = "--all" ]; then
-    [ -d "$ROOT" ] || { info "Keine Profile vorhanden."; return 0; }
+    [ -d "$ROOT" ] || { [ "$quiet" = yes ] || info "Keine Profile vorhanden."; return 0; }
     for dir in "$ROOT"/*/; do
       [ -d "$dir" ] || continue
       name="$(basename "$dir")"
-      isolate=no; [ -e "$dir/.ccacct-isolate-projects" ] && isolate=yes
-      link_shared "${dir%/}" "$isolate"
-      info "synchronisiert: $name"
+      out="$(sync_profile "$name" "$links_only" "$force")"
+      [ "$quiet" = yes ] || info "$out"
     done
   else
     [ "$target" = "default" ] && die "Das Primärprofil ist die Quelle — nichts zu synchronisieren"
-    dir="$(profile_dir "$target")" || die "unbekanntes Profil: $target"
-    isolate=no; [ -e "$dir/.ccacct-isolate-projects" ] && isolate=yes
-    link_shared "$dir" "$isolate"
-    info "synchronisiert: $target"
+    profile_dir "$target" >/dev/null || die "unbekanntes Profil: $target"
+    out="$(sync_profile "$target" "$links_only" "$force")"
+    [ "$quiet" = yes ] || info "$out"
   fi
+}
+
+# Meldet Abweichungen eines Profils vom Primärprofil auf stdout, Exitcode 1 bei Drift.
+check_profile() {
+  local name="$1" dir isolate item drift=0 link
+  dir="$(profile_dir "$name")" || return 2
+  isolate="$(isolate_flag_for "$dir")"
+
+  for item in $(cd "$PRIMARY" && ls -A); do
+    is_isolated "$item" "$isolate" && continue
+    if [ ! -L "$dir/$item" ]; then
+      printf '  %s: kein Symlink auf das Primärprofil\n' "$item"; drift=1; continue
+    fi
+    link="$(readlink "$dir/$item")"
+    if [ "$link" != "$PRIMARY/$item" ]; then
+      printf '  %s: zeigt auf %s statt auf %s\n' "$item" "$link" "$PRIMARY/$item"; drift=1
+    fi
+  done
+
+  local missing
+  missing="$(python3 - "$(global_json_for "$PRIMARY")" "$(global_json_for "$dir")" "$ACCOUNT_KEYS" <<'PY'
+import json, sys
+
+def load(p):
+    try:
+        with open(p) as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+primary, profile, account_keys = load(sys.argv[1]), load(sys.argv[2]), set(json.loads(sys.argv[3]))
+for key, value in primary.items():
+    if key in account_keys:
+        continue
+    if key not in profile:
+        print("  .claude.json: Schlüssel '%s' fehlt" % key)
+    elif key != "projects" and profile[key] != value:
+        print("  .claude.json: Schlüssel '%s' weicht ab" % key)
+    elif key == "projects" and isinstance(value, dict):
+        for proj, cfg in value.items():
+            if (profile.get("projects") or {}).get(proj) != cfg:
+                print("  .claude.json: projects['%s'] weicht ab" % proj)
+PY
+)"
+  if [ -n "$missing" ]; then printf '%s\n' "$missing"; drift=1; fi
+  return $drift
+}
+
+cmd_doctor() {
+  local target="" fix=no arg rc=0
+  for arg in "$@"; do
+    case "$arg" in
+      --all)      target="--all" ;;
+      --fix)      fix=yes ;;
+      -*)         die "unbekannte Option: $arg" ;;
+      *)          target="$arg" ;;
+    esac
+  done
+  [ -n "$target" ] || target="--all"
+
+  local names name out
+  if [ "$target" = "--all" ]; then
+    names="$(list_profiles | grep -v '^default$')"
+    [ -n "$names" ] || { info "Keine weiteren Profile vorhanden."; return 0; }
+  else
+    [ "$target" = "default" ] && die "Das Primärprofil ist die Referenz"
+    profile_dir "$target" >/dev/null || die "unbekanntes Profil: $target"
+    names="$target"
+  fi
+
+  while read -r name; do
+    [ -n "$name" ] || continue
+    if [ "$fix" = "yes" ]; then
+      sync_profile "$name" no yes >/dev/null
+    fi
+    out="$(check_profile "$name")"
+    if [ -z "$out" ]; then
+      printf '\033[32m✓\033[0m %s — identisch mit default\n' "$name"
+    else
+      printf '\033[31m✗\033[0m %s — Abweichungen:\n%s\n' "$name" "$out"
+      rc=1
+    fi
+  done <<< "$names"
+
+  [ "$rc" -eq 0 ] || info "Beheben mit: ccacct doctor ${target} --fix"
+  return $rc
+}
+
+# Hook in der (geteilten) settings.json, der bei jedem Sessionstart die Links
+# nachzieht — so bleibt das Setup identisch, ohne dass du daran denken musst.
+cmd_autosync() {
+  local action="${1:-status}"
+  local settings="$PRIMARY/settings.json"
+  local command="CCACCT_AUTOSYNC=1 \"$SELF\" sync --all --links-only --quiet"
+  case "$action" in
+    install|uninstall|status) ;;
+    *) die "Aufruf: ccacct autosync install|uninstall|status" ;;
+  esac
+  python3 - "$settings" "$command" "$action" <<'PY'
+import json, os, sys, tempfile
+
+path, command, action = sys.argv[1], sys.argv[2], sys.argv[3]
+marker = "CCACCT_AUTOSYNC"
+
+try:
+    with open(path) as fh:
+        settings = json.load(fh)
+except FileNotFoundError:
+    settings = {}
+except Exception as exc:
+    sys.exit("settings.json ist nicht lesbar: %s" % exc)
+
+hooks = settings.setdefault("hooks", {})
+groups = hooks.setdefault("SessionStart", [])
+
+def has_hook():
+    for group in groups:
+        for hook in group.get("hooks", []):
+            if marker in str(hook.get("command", "")):
+                return True
+    return False
+
+if action == "status":
+    print("autosync ist %s" % ("installiert" if has_hook() else "nicht installiert"))
+    sys.exit(0)
+
+if action == "install":
+    if has_hook():
+        print("autosync ist bereits installiert")
+        sys.exit(0)
+    groups.append({"hooks": [{"type": "command", "command": command, "timeout": 15}]})
+elif action == "uninstall":
+    if not has_hook():
+        print("autosync war nicht installiert")
+        sys.exit(0)
+    for group in groups:
+        group["hooks"] = [h for h in group.get("hooks", [])
+                          if marker not in str(h.get("command", ""))]
+    hooks["SessionStart"] = [g for g in groups if g.get("hooks")]
+    if not hooks["SessionStart"]:
+        del hooks["SessionStart"]
+    if not hooks:
+        del settings["hooks"]
+
+# settings.json kann ein Symlink ins Primärprofil sein — Ziel beschreiben, nicht ersetzen.
+target = os.path.realpath(path)
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(target) or ".", prefix=".settings.json.")
+with os.fdopen(fd, "w") as fh:
+    json.dump(settings, fh, indent=2)
+os.replace(tmp, target)
+print("autosync %s" % ("installiert" if action == "install" else "entfernt"))
+PY
 }
 
 cmd_rm() {
@@ -308,10 +570,6 @@ cmd_rm() {
     die "Löscht Anmeldung, Sessions und History von '$name'. Bestätige mit: ccacct rm $name --force"
   fi
   # Symlinks zuerst entfernen, damit kein rm -rf durch einen Link läuft.
-  local item
-  for item in "${SHARED[@]}"; do
-    [ -L "$ROOT/$name/$item" ] && rm -f "$ROOT/$name/$item"
-  done
   find "$ROOT/$name" -type l -delete 2>/dev/null
   rm -rf "${ROOT:?}/${name:?}"
   info "Profil '$name' gelöscht. Geteilte Inhalte in $PRIMARY sind unangetastet."
@@ -334,21 +592,21 @@ function ccacct --description 'Claude-Code-Accounts verwalten und wechseln'
             echo "Aktives Profil: default"
             return 0
         end
-        set -l dir (command $0 path \$name); or return 1
+        set -l dir (command $SELF path \$name); or return 1
         set -gx CLAUDE_CONFIG_DIR \$dir
         echo "Aktives Profil: \$name (\$dir)"
         return 0
     end
-    command $0 \$argv
+    command $SELF \$argv
 end
 
 complete -c ccacct -f
-complete -c ccacct -n '__fish_use_subcommand' -a 'use list add login logout run exec path which sync rm shell-init help'
-complete -c ccacct -n '__fish_seen_subcommand_from use run exec path login logout sync rm' -a '(command $0 list 2>/dev/null | tail -n +2 | string trim | string replace -r "^\\\\*?\\\\s*" "" | string split -f1 " ")'
+complete -c ccacct -n '__fish_use_subcommand' -a 'use list add login logout run exec path which sync doctor autosync rm shell-init help'
+complete -c ccacct -n '__fish_seen_subcommand_from use run exec path login logout sync doctor rm' -a '(command $SELF list 2>/dev/null | tail -n +2 | string trim | string replace -r "^\\\\*?\\\\s*" "" | string split -f1 " ")'
 EOF
       ;;
     bash|zsh) cat <<EOF
-# ccacct — bash/zsh-Integration.  In .bashrc/.zshrc:  eval "\$($0 shell-init bash)"
+# ccacct — bash/zsh-Integration.  In .bashrc/.zshrc:  eval "\$($SELF shell-init bash)"
 ccacct() {
   if [ "\${1:-}" = "use" ]; then
     if [ -z "\${2:-}" ]; then echo "Aufruf: ccacct use <name>" >&2; return 1; fi
@@ -358,12 +616,12 @@ ccacct() {
       return 0
     fi
     local dir
-    dir="\$(command $0 path "\$2")" || return 1
+    dir="\$(command $SELF path "\$2")" || return 1
     export CLAUDE_CONFIG_DIR="\$dir"
     echo "Aktives Profil: \$2 (\$dir)"
     return 0
   fi
-  command $0 "\$@"
+  command $SELF "\$@"
 }
 EOF
       ;;
@@ -377,7 +635,7 @@ ccacct — mehrere Claude-Code-Accounts parallel halten und nahtlos wechseln
 
   ccacct list                       Profile mit Account, Abo und Login-Status
   ccacct add <name> [--isolate-projects]
-                                    Neues Profil anlegen (teilt Config mit default)
+                                    Neues Profil anlegen (Symlinks auf default)
   ccacct login <name>               Claude Code starten und in dem Profil anmelden
   ccacct logout <name>              Aus dem Profil abmelden
   ccacct use <name>                 Profil für die aktuelle Shell aktivieren
@@ -386,14 +644,18 @@ ccacct — mehrere Claude-Code-Accounts parallel halten und nahtlos wechseln
   ccacct exec <name> -- <cmd…>      Beliebiges Kommando im Profilkontext ausführen
   ccacct which                      Aktuell aktives Profil
   ccacct path <name>                Configdir des Profils
-  ccacct sync [<name>|--all]        Geteilte Symlinks reparieren/nachziehen
+  ccacct sync [<name>|--all] [--links-only] [--force] [--quiet]
+                                    Setup-Spiegelung nachziehen
+  ccacct doctor [<name>|--all] [--fix]
+                                    Prüfen, ob jedes Profil identisch zu default ist
+  ccacct autosync install|uninstall|status
+                                    Bei jedem Sessionstart automatisch syncen
   ccacct rm <name> --force          Profil samt Anmeldung löschen
   ccacct shell-init fish|bash|zsh   Shell-Integration ausgeben
 
-Geteilt mit dem Primärprofil ($PRIMARY):
-  ${SHARED[*]}
-Getrennt je Profil:
-  Anmeldung (.credentials.json), .claude.json, History, Sessions, Tasks
+Das Setup liegt genau einmal in $PRIMARY. Profile verlinken darauf — keine Kopien.
+Getrennt ist nur der Account: .credentials.json, die Identitätsschlüssel in
+.claude.json sowie History, Sessions und Tasks.
 
 Umgebungsvariablen: CCACCT_PRIMARY, CCACCT_ROOT, CCACCT_CLAUDE_BIN
 EOF
@@ -413,6 +675,8 @@ main() {
     which|current)    cmd_which "$@" ;;
     path|dir)         cmd_path "$@" ;;
     sync)             cmd_sync "$@" ;;
+    doctor|check)     cmd_doctor "$@" ;;
+    autosync)         cmd_autosync "$@" ;;
     rm|remove|delete) cmd_rm "$@" ;;
     shell-init)       cmd_shell_init "$@" ;;
     use)              die "'use' muss die Shell selbst ausführen — richte die Integration ein: ccacct shell-init fish | source" ;;
